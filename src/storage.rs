@@ -24,6 +24,13 @@ const IDEMPOTENCY_TTL_LEDGERS: u32 = 18_000;
 /// Minimum TTL we require on transaction records before extending.
 const TRANSACTION_MIN_TTL_LEDGERS: u32 = 100_000; // ~1 week
 
+/// Maximum number of temporary idempotency-key entries evicted per
+/// [`StorageClient::drain_expiring_temp_storage`] call.
+///
+/// Bounds the per-call resource cost so a large backlog is cleared across
+/// several invocations rather than in a single unbounded sweep.
+pub const DRAIN_BATCH_SIZE: u32 = 25;
+
 pub struct StorageClient;
 
 impl StorageClient {
@@ -191,5 +198,40 @@ impl StorageClient {
             IDEMPOTENCY_TTL_LEDGERS,
             IDEMPOTENCY_TTL_LEDGERS,
         );
+    }
+
+    /// Returns `true` if the temporary idempotency key `key` is still within
+    /// its valid TTL window and must therefore not be drained.
+    ///
+    /// The key is considered *expiring* (safe to evict) only once the ledger
+    /// sequence has advanced at least [`IDEMPOTENCY_TTL_LEDGERS`] past the
+    /// sequence at which it was recorded.  The boundary is inclusive: a key
+    /// recorded exactly `IDEMPOTENCY_TTL_LEDGERS` ledgers ago is expiring.
+    ///
+    /// Returns `false` for unknown keys so callers never treat a missing entry
+    /// as live.
+    pub fn is_idempotency_key_expiring(env: &Env, key: &String) -> bool {
+        match Self::get_idempotency_key(env, key) {
+            Some(stored_at) => {
+                env.ledger().sequence() >= stored_at.saturating_add(IDEMPOTENCY_TTL_LEDGERS)
+            }
+            None => false,
+        }
+    }
+
+    /// Evict a single temporary idempotency key, but only if it has already
+    /// passed its TTL window.
+    ///
+    /// Returns `true` when the entry was removed.  A key still within its valid
+    /// TTL window (or unknown) is left untouched and `false` is returned, so
+    /// this can never remove a live entry by mistake.
+    pub fn drain_idempotency_key_if_expiring(env: &Env, key: &String) -> bool {
+        if !Self::is_idempotency_key_expiring(env, key) {
+            return false;
+        }
+        env.storage()
+            .temporary()
+            .remove(&StorageKey::IdempotencyKey(key.clone()));
+        true
     }
 }
