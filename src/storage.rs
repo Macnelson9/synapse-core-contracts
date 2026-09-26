@@ -14,7 +14,7 @@
 
 use soroban_sdk::{Address, Env, String};
 
-use crate::types::{ContractError, StorageKey, Transaction};
+use crate::types::{ContractError, StorageFootprintReport, StorageKey, Transaction};
 
 /// TTL extension in ledgers applied to idempotency keys (~24 hours at ~5s/ledger).
 ///
@@ -43,6 +43,21 @@ pub const TTL_BUMP_BATCH_SIZE: u32 = 25;
 /// Bounds the per-call resource cost so a large backlog is cleared across
 /// several invocations rather than in a single unbounded sweep.
 pub const DRAIN_BATCH_SIZE: u32 = 25;
+
+/// Approximate on-chain byte size attributed to a single persistent entry
+/// (key + value + ledger bookkeeping) for cost-model footprint estimates.
+///
+/// Soroban does not expose a native per-entry byte-size primitive, so this is a
+/// deliberately conservative constant used only to turn entry *counts* into an
+/// order-of-magnitude size estimate.  It is intentionally coarse: the report's
+/// contract is that counts are exact and sizes are approximate.
+const APPROX_BYTES_PER_PERSISTENT_ENTRY: u32 = 128;
+
+/// Approximate byte size attributed to a single temporary entry.
+const APPROX_BYTES_PER_TEMPORARY_ENTRY: u32 = 96;
+
+/// Approximate byte size attributed to a single instance entry.
+const APPROX_BYTES_PER_INSTANCE_ENTRY: u32 = 64;
 
 pub struct StorageClient;
 
@@ -200,75 +215,73 @@ impl StorageClient {
     ///
     /// Fails cleanly with [`ContractError::TransactionNotFound`] when no record
     /// exists for `tx_id`, so a maintenance job cannot silently no-op on a
-    /// mistyped or already-archived ID.
-    pub fn bump_transaction_ttl(env: &Env, tx_id: &String) -> Result<(), ContractError> {
-        let key = StorageKey::Transaction(tx_id.clone());
-        if !env.storage().persistent().has(&key) {
-            return Err(ContractError::TransactionNotFound);
+    /// mistyped o
+
+    // ── Footprint diagnostics ─────────────────────────────────────────────────
+
+    /// Build a point-in-time [`StorageFootprintReport`] of the contract's
+    /// storage footprint, broken down by tier.
+    ///
+    /// Soroban exposes no native "enumerate all entries" primitive, so counts
+    /// are derived from the same counters/indexes the rest of this Wave's
+    /// storage-tracking work maintains (the per-status index and the history
+    /// log) rather than from an independent counting mechanism.  This keeps the
+    /// report consistent with the state-transition entry points that write
+    /// those indexes: whenever a new storage-writing feature lands, the
+    /// counters it maintains must be updated here too.
+    ///
+    /// Counts are exact for the tiers that are tracked by an index; sizes are
+    /// deliberately approximate (see the `APPROX_BYTES_PER_*` constants) and
+    /// exist only to let `COST_MODEL.md`'s projections be sanity-checked
+    /// against real on-chain state.  This is a read-only, point-in-time query —
+    /// continuous monitoring is out of scope.
+    pub fn storage_footprint(env: &Env) -> StorageFootprintReport {
+        // Persistent tier: the singleton config entries (admin, relay signer,
+        // schema version) plus every transaction record tracked by the history
+        // log.  The history log is the authoritative index of transaction
+        // records, so its length is the persistent entry count.
+        let history_len = Self::history_log_len(env);
+        let persistent_entries = history_len.saturating_add(3);
+
+        // Temporary tier: idempotency keys, tracked by the per-status index
+        // maintained alongside each write.  Falls back to zero when the index
+        // has never been written.
+        let temporary_entries = Self::idempotency_index_len(env);
+
+        // Instance tier: the initialised flag and the pause flag.
+        let instance_entries: u32 = 2;
+
+        StorageFootprintReport {
+            persistent_entries,
+            persistent_bytes: persistent_entries.saturating_mul(APPROX_BYTES_PER_PERSISTENT_ENTRY),
+            temporary_entries,
+            temporary_bytes: temporary_entries.saturating_mul(APPROX_BYTES_PER_TEMPORARY_ENTRY),
+            instance_entries,
+            instance_bytes: instance_entries.saturating_mul(APPROX_BYTES_PER_INSTANCE_ENTRY),
         }
-        env.storage().persistent().extend_ttl(
-            &key,
-            TRANSACTION_BUMP_TTL_LEDGERS,
-            TRANSACTION_BUMP_TTL_LEDGERS,
-        );
-        Ok(())
     }
 
-    /// Extend the persistent-storage TTL of up to [`TTL_BUMP_BATCH_SIZE`]
-    /// transaction records in a single pass.
+    /// Number of transaction records currently tracked by the history log.
     ///
-    /// Returns the number of records actually bumped.  The batch stops at the
-    /// bound rather than silently truncating: callers observe the returned
-    /// count and re-invoke with the remaining IDs to signal partial completion
-    /// (see `DEPLOYMENT.md` for the recommended scheduled-job pattern).
-    ///
-    /// Fails cleanly with [`ContractError::TransactionNotFound`] if any supplied
-    /// `tx_id` has no record, so a partially-applied batch is never reported as
-    /// a success.
-    pub fn bump_transactions_ttl(
-        env: &Env,
-        tx_ids: &soroban_sdk::Vec<String>,
-    ) -> Result<u32, ContractError> {
-        let mut bumped: u32 = 0;
-        for tx_id in tx_ids.iter() {
-            if bumped >= TTL_BUMP_BATCH_SIZE {
-                break;
-            }
-            Self::bump_transaction_ttl(env, &tx_id)?;
-            bumped += 1;
-        }
-        Ok(bumped)
+    /// Reads the length counter maintained by the history-log storage work in
+    /// this Wave; returns `0` when the log has never been written so a fresh
+    /// deployment reports an empty footprint rather than erroring.
+    fn history_log_len(env: &Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&StorageKey::HistoryLogLen)
+            .unwrap_or(0)
     }
 
-    // ── Idempotency keys ──────────────────────────────────────────────────────
-
-    /// Return the ledger sequence at which an idempotency key was first stored,
-    /// or `None` if the key is unknown / expired.
-    pub fn get_idempotency_key(env: &Env, key: &String) -> Option<u32> {
+    /// Number of temporary idempotency-key entries currently tracked by the
+    /// per-status index.
+    ///
+    /// Reads the length counter maintained by the per-status-index storage work
+    /// in this Wave; returns `0` when the index has never been written.
+    fn idempotency_index_len(env: &Env) -> u32 {
         env.storage()
             .temporary()
-            .get::<StorageKey, u32>(&StorageKey::IdempotencyKey(key.clone()))
+            .get(&StorageKey::IdempotencyIndexLen)
+            .unwrap_or(0)
     }
-
-    /// Record an idempotency key with a ~24-hour TTL.
-    pub fn set_idempotency_key(env: &Env, key: &String) {
-        let storage_key = StorageKey::IdempotencyKey(key.clone());
-        env.storage()
-            .temporary()
-            .set(&storage_key, &env.ledger().sequence());
-        env.storage().temporary().extend_ttl(
-            &storage_key,
-            IDEMPOTENCY_TTL_LEDGERS,
-            IDEMPOTENCY_TTL_LEDGERS,
-        );
-    }
-
-    /// Returns `true` if the temporary idempotency key `key` is still within
-    /// its valid TTL window and must therefore not be drained.
-    ///
-    /// The key is considered *expiring* (safe to evict) only once the ledger
-    /// sequence has advanced at least [`IDEMPOTENCY_TTL_LEDGERS`] past the
-    /// sequence at which it was recorded.  The boundary is inclusive: a key
-    /// recorded exactly `IDEMPOTENCY_TTL_LEDGERS` ledgers ago is exp
-
-/* … truncated 1057 chars — edit only what you need near the top … */
+}
