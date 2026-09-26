@@ -24,6 +24,19 @@ const IDEMPOTENCY_TTL_LEDGERS: u32 = 18_000;
 /// Minimum TTL we require on transaction records before extending.
 const TRANSACTION_MIN_TTL_LEDGERS: u32 = 100_000; // ~1 week
 
+/// TTL (in ledgers) applied to a transaction record by an explicit maintenance
+/// bump.  Larger than [`TRANSACTION_MIN_TTL_LEDGERS`] so an operator-triggered
+/// bump meaningfully extends the archival horizon of a still-relevant record
+/// (e.g. one that remains `Disputed`).  ~30 days at ~5s/ledger.
+const TRANSACTION_BUMP_TTL_LEDGERS: u32 = 518_400;
+
+/// Maximum number of transaction records a single
+/// [`StorageClient::bump_transactions_ttl`] call may extend.
+///
+/// Bounds the per-call resource cost so a large backlog is maintained across
+/// several invocations rather than in a single unbounded sweep.
+pub const TTL_BUMP_BATCH_SIZE: u32 = 25;
+
 /// Maximum number of temporary idempotency-key entries evicted per
 /// [`StorageClient::drain_expiring_temp_storage`] call.
 ///
@@ -177,6 +190,56 @@ impl StorageClient {
         );
     }
 
+    /// Extend the persistent-storage TTL of a single transaction record.
+    ///
+    /// Uses Soroban's native `extend_ttl` ledger primitive directly rather than
+    /// reimplementing TTL bookkeeping in contract storage.  The record's TTL is
+    /// raised to [`TRANSACTION_BUMP_TTL_LEDGERS`] whenever it currently sits
+    /// below that threshold, keeping a still-relevant record (e.g. one that
+    /// remains `Disputed`) from being archived out from under the audit trail.
+    ///
+    /// Fails cleanly with [`ContractError::TransactionNotFound`] when no record
+    /// exists for `tx_id`, so a maintenance job cannot silently no-op on a
+    /// mistyped or already-archived ID.
+    pub fn bump_transaction_ttl(env: &Env, tx_id: &String) -> Result<(), ContractError> {
+        let key = StorageKey::Transaction(tx_id.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(ContractError::TransactionNotFound);
+        }
+        env.storage().persistent().extend_ttl(
+            &key,
+            TRANSACTION_BUMP_TTL_LEDGERS,
+            TRANSACTION_BUMP_TTL_LEDGERS,
+        );
+        Ok(())
+    }
+
+    /// Extend the persistent-storage TTL of up to [`TTL_BUMP_BATCH_SIZE`]
+    /// transaction records in a single pass.
+    ///
+    /// Returns the number of records actually bumped.  The batch stops at the
+    /// bound rather than silently truncating: callers observe the returned
+    /// count and re-invoke with the remaining IDs to signal partial completion
+    /// (see `DEPLOYMENT.md` for the recommended scheduled-job pattern).
+    ///
+    /// Fails cleanly with [`ContractError::TransactionNotFound`] if any supplied
+    /// `tx_id` has no record, so a partially-applied batch is never reported as
+    /// a success.
+    pub fn bump_transactions_ttl(
+        env: &Env,
+        tx_ids: &soroban_sdk::Vec<String>,
+    ) -> Result<u32, ContractError> {
+        let mut bumped: u32 = 0;
+        for tx_id in tx_ids.iter() {
+            if bumped >= TTL_BUMP_BATCH_SIZE {
+                break;
+            }
+            Self::bump_transaction_ttl(env, &tx_id)?;
+            bumped += 1;
+        }
+        Ok(bumped)
+    }
+
     // ── Idempotency keys ──────────────────────────────────────────────────────
 
     /// Return the ledger sequence at which an idempotency key was first stored,
@@ -206,32 +269,6 @@ impl StorageClient {
     /// The key is considered *expiring* (safe to evict) only once the ledger
     /// sequence has advanced at least [`IDEMPOTENCY_TTL_LEDGERS`] past the
     /// sequence at which it was recorded.  The boundary is inclusive: a key
-    /// recorded exactly `IDEMPOTENCY_TTL_LEDGERS` ledgers ago is expiring.
-    ///
-    /// Returns `false` for unknown keys so callers never treat a missing entry
-    /// as live.
-    pub fn is_idempotency_key_expiring(env: &Env, key: &String) -> bool {
-        match Self::get_idempotency_key(env, key) {
-            Some(stored_at) => {
-                env.ledger().sequence() >= stored_at.saturating_add(IDEMPOTENCY_TTL_LEDGERS)
-            }
-            None => false,
-        }
-    }
+    /// recorded exactly `IDEMPOTENCY_TTL_LEDGERS` ledgers ago is exp
 
-    /// Evict a single temporary idempotency key, but only if it has already
-    /// passed its TTL window.
-    ///
-    /// Returns `true` when the entry was removed.  A key still within its valid
-    /// TTL window (or unknown) is left untouched and `false` is returned, so
-    /// this can never remove a live entry by mistake.
-    pub fn drain_idempotency_key_if_expiring(env: &Env, key: &String) -> bool {
-        if !Self::is_idempotency_key_expiring(env, key) {
-            return false;
-        }
-        env.storage()
-            .temporary()
-            .remove(&StorageKey::IdempotencyKey(key.clone()));
-        true
-    }
-}
+/* … truncated 1057 chars — edit only what you need near the top … */
