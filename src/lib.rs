@@ -35,6 +35,9 @@ mod validation;
 #[cfg(test)]
 mod test_pause;
 #[cfg(test)]
+    AdminRateLimitConfig, CallbackPayload, ContractError, PendingRelaySigner, RelaySignerSet,
+    RoleScope, Transaction, TransactionStatus, UnpauseRoles, MAX_BATCH_SIZE, SCHEMA_VERSION,
+#[cfg(test)]
 mod tests;
 
 use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, String, Vec};
@@ -43,7 +46,8 @@ use crate::admin::AdminClient;
 use crate::events::EventEmitter;
 use crate::storage::StorageClient;
 use crate::types::{
-    CallbackPayload, ContractError, Transaction, TransactionStatus, SCHEMA_VERSION,
+    AdminRateLimitConfig, CallbackPayload, ContractError, PendingRelaySigner, RelaySignerSet, RoleScope, Transaction, TransactionStatus,
+    UnpauseRoles, MAX_BATCH_SIZE, MAX_PAGE_LIMIT, MAX_RETRIES, DEFAULT_RELAY_SIGNER_DELAY_LEDGERS, SCHEMA_VERSION,
 };
 use crate::validation::Validator;
 
@@ -118,8 +122,19 @@ impl SynapseCoreContract {
         }
 
         // Only the trusted relay signer may forward Anchor Platform callbacks.
-        let relay = StorageClient::get_relay_signer(&env)?;
-        relay.require_auth();
+        AdminClient::require_relay_quorum(&env, None)?;
+
+        // Anchor allowlist: an empty allowlist means "all anchors" (backward
+        // compatible default, weaker; tighten post-deployment). The anchor
+        // identity is the payload's `asset_issuer`.
+        let allowed = StorageClient::get_relay_anchors(&env, &relay);
+        if !allowed.is_empty() && !allowed.contains(&payload.asset_issuer) {
+            return Err(ContractError::AnchorNotAllowed);
+        }
+
+        // Quarantine: a signer with a stale heartbeat cannot take new intake.
+        // Existing Pending/Processing work stays processable.
+        AdminClient::assert_not_quarantined(&env, &relay)?;
 
         Validator::validate_payload(&env, &payload)?;
 
@@ -137,6 +152,13 @@ impl SynapseCoreContract {
             return Err(ContractError::DuplicateRequest);
         }
 
+        // Backpressure: bound this signer's outstanding Pending backlog.
+        if let Some(cap) = StorageClient::get_max_pending_per_signer(&env) {
+            if StorageClient::get_pending_count(&env, &relay) >= cap {
+                return Err(ContractError::OutstandingCapExceeded);
+            }
+        }
+
         let ledger = env.ledger().sequence();
         let tx = Transaction {
             id: payload.transaction_id.clone(),
@@ -152,10 +174,17 @@ impl SynapseCoreContract {
             callback_status: payload.callback_status.clone(),
             stellar_tx_hash: String::from_str(&env, ""),
             failure_reason: String::from_str(&env, ""),
+            registered_at: env.ledger().timestamp(),
+            settled_amount: None,
+            assigned_signer: None,
+            tags: Vec::new(&env),
+            retry_count: 0,
         };
 
         StorageClient::save_transaction(&env, &tx);
         StorageClient::set_idempotency_key(&env, &payload.idempotency_key);
+        StorageClient::append_history(&env, &tx.id, TransactionStatus::Pending, &relay);
+        StorageClient::inc_pending(&env, &relay, &tx.id);
         EventEmitter::transaction_registered(&env, &tx);
 
         Ok(tx.id)
@@ -238,6 +267,76 @@ impl SynapseCoreContract {
         Ok(count)
     }
 
+    /// Register up to [`MAX_BATCH_SIZE`] callbacks atomically.
+    ///
+    /// Relay signer only. Every payload is validated, and checked against
+    /// on-chain and in-batch duplicate `transaction_id`s, *before* any storage
+    /// write; any failure aborts the whole call with no partial writes.
+    /// An empty or oversized batch is rejected with
+    /// [`ContractError::InvalidBatchSize`].
+    ///
+    /// # Events
+    /// Emits [`events::EventTransactionRegistered`] per payload followed by one
+    /// [`events::EventBatchProcessed`].
+    pub fn batch_register_callback(
+        env: Env,
+        payloads: Vec<CallbackPayload>,
+        caller: Address,
+    ) -> Result<u32, ContractError> {
+        if StorageClient::is_paused(&env) {
+            return Err(ContractError::ContractPaused);
+        }
+        AdminClient::require_relay_signer(&env, &caller)?;
+        caller.require_auth();
+
+        let n = payloads.len();
+        if n == 0 || n > MAX_BATCH_SIZE {
+            return Err(ContractError::InvalidBatchSize);
+        }
+
+        // Pass 1: validate everything; no writes.
+        for i in 0..n {
+            let p = payloads.get_unchecked(i);
+            Validator::validate_payload(&env, &p)?;
+            if StorageClient::transaction_exists(&env, &p.transaction_id) {
+                return Err(ContractError::DuplicateRequest);
+            }
+            for j in 0..i {
+                if payloads.get_unchecked(j).transaction_id == p.transaction_id {
+                    return Err(ContractError::DuplicateRequest);
+                }
+            }
+        }
+
+        // Pass 2: write.
+        let ledger = env.ledger().sequence();
+        for p in payloads.iter() {
+            let tx = Transaction {
+                id: p.transaction_id.clone(),
+                stellar_account: p.stellar_account.clone(),
+                amount: p.amount,
+                asset_code: p.asset_code.clone(),
+                asset_issuer: p.asset_issuer.clone(),
+                status: TransactionStatus::Pending,
+                created_at_ledger: ledger,
+                updated_at_ledger: ledger,
+                anchor_transaction_id: p.anchor_transaction_id.clone(),
+                callback_type: p.callback_type.clone(),
+                callback_status: p.callback_status.clone(),
+                stellar_tx_hash: String::from_str(&env, ""),
+                failure_reason: String::from_str(&env, ""),
+                retry_count: 0,
+            };
+            StorageClient::save_transaction(&env, &tx);
+            StorageClient::set_idempotency_key(&env, &p.idempotency_key);
+            EventEmitter::transaction_registered(&env, &tx);
+        }
+        EventEmitter::batch_processed(&env, n, &caller);
+
+        Ok(n)
+    }
+    }
+
     // ── Status transitions ────────────────────────────────────────────────────
 
     /// Mark a `Pending` transaction as `Processing`.
@@ -245,7 +344,7 @@ impl SynapseCoreContract {
     /// Called by the relay when the off-chain processor picks up the job.
     /// Enforces the state machine: only `Pending → Processing` is valid here.
     pub fn start_processing(env: Env, tx_id: String, caller: Address) -> Result<(), ContractError> {
-        AdminClient::assert_is_relay_or_admin(&env, &caller)?;
+        AdminClient::require_scope(&env, &caller, RoleScope::StartProcessing)?;
 
         let mut tx = StorageClient::get_transaction(&env, &tx_id)?;
         if tx.status != TransactionStatus::Pending {
@@ -256,6 +355,8 @@ impl SynapseCoreContract {
         tx.updated_at_ledger = env.ledger().sequence();
 
         StorageClient::save_transaction(&env, &tx);
+        StorageClient::append_history(&env, &tx_id, TransactionStatus::Processing, &caller);
+        StorageClient::dec_pending(&env, &tx_id);
         EventEmitter::status_changed(&env, &tx_id, old_status, TransactionStatus::Processing);
 
         Ok(())
@@ -271,7 +372,29 @@ impl SynapseCoreContract {
         stellar_tx_hash: String,
         caller: Address,
     ) -> Result<(), ContractError> {
-        AdminClient::assert_is_relay_or_admin(&env, &caller)?;
-        Validator::validate_stell
+        AdminClient::require_scope(&env, &caller, RoleScope::CompleteTransaction)?;
+        Validator::validate_stellar_tx_hash(&stellar_tx_hash)?;
 
-/* … truncated 10638 chars — edit only what you need near the top … */
+        let mut tx = StorageClient::get_transaction(&env, &tx_id)?;
+        AdminClient::assert_can_drive_tx(&env, &caller, &tx.assigned_signer)?;
+        if tx.status != TransactionStatus::Processing {
+            return Err(ContractError::InvalidStatusTransition);
+        }
+        let old_status = tx.status.clone();
+        tx.status = TransactionStatus::Completed;
+        tx.stellar_tx_hash = stellar_tx_hash.clone();
+        tx.updated_at_ledger = env.ledger().sequence();
+
+        StorageClient::save_transaction(&env, &tx);
+        StorageClient::append_history(&env, &tx_id, TransactionStatus::Completed, &caller);
+        EventEmitter::status_changed(&env, &tx_id, old_status, TransactionStatus::Completed);
+        EventEmitter::transaction_completed(&env, &tx_id, &stellar_tx_hash);
+        // Additive phase-router hook: only when a route is configured.
+        if let Some(next_phase) = StorageClient::get_forward_route(&env, &tx_id) {
+            if next_phase != 0 {
+                EventEmitter::forwarding_intent(&env, &tx_id, next_phase);
+            }
+        }
+
+        Ok(())
+    }

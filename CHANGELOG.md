@@ -141,3 +141,11 @@ Rules of thumb (normative text in [`EVENTS.md`](./EVENTS.md#5-semver-policy)):
 
 - Removal / rename / reorder / type change / emission-order change → **major** + advance notice.
 - New trailing field or new event type → **minor** (or patch if docs-only).
+
+## Unreleased
+
+- Added `get_nonce` and `*_with_nonce` variants of privileged entry points
+  (per-address strictly sequential nonce; gaps and reuse fail with `InvalidNonce`).
+  Existing signatures are unchanged; off-chain relay should migrate to the
+  nonce variants before the plain ones are removed in a future breaking release.
+- Added append-only `get_transaction_history` (cap 32 entries, oldest evicted). Transactions registered before this release have no history; an off-chain migration note applies (no on-chain backfill).

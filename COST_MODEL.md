@@ -43,6 +43,7 @@ Key: `StorageKey::Transaction(tx_id)` where `tx_id` is a UUID (36 chars).
 | `callback_status`      | `String`         | 24 B     | ~20 chars + 4-byte prefix                    |
 | `stellar_tx_hash`      | `String`         | 4 B      | Empty string initially (4-byte prefix only)  |
 | `failure_reason`       | `String`         | 4 B      | Empty string initially (4-byte prefix only)  |
+| `tags`                 | `Vec<String>`    | 4 B+     | Empty vec initially; see section 2.1.1       |
 | **Struct subtotal**    |                  | **280 B** |                                              |
 | Storage key overhead   | `StorageKey` enum| 44 B     | 4-byte discriminant + 40-byte String         |
 | XDR framing            |                  | 8 B      | Struct header / padding                      |
@@ -52,6 +53,21 @@ Key: `StorageKey::Transaction(tx_id)` where `tx_id` is a UUID (36 chars).
 > are replaced with populated values during the transaction lifecycle.  Their
 > worst-case sizes are 68 B (64-char hex hash + prefix) and 24 B respectively.
 > After final status, the entry grows to ~396 B.
+
+#### 2.1.1 Tag storage (append-only, capped)
+
+Tags are capped at 8 per transaction and 32 chars each. Each tag costs
+`4 B length prefix + chars` (XDR pads to 4 B), on top of a 4 B vec header:
+
+| Tags | Example content       | Added size |
+|------|-----------------------|------------|
+| 1    | one ~20-char tag      | ~24 B      |
+| 5    | five ~20-char tags    | ~120 B     |
+| 8 (max) | eight 32-char tags | ~288 B     |
+
+Even at the cap the record stays within the 512 B fee-rounding bucket only
+when other fields are near their typical sizes; budget up to the next bucket
+for fully tagged records.
 
 ### 2.2 Temporary entry — idempotency key
 
@@ -240,3 +256,14 @@ account for off-chain monitoring reads.
 entry via megabyte-sized strings.  The caps close this vector with negligible
 impact on typical usage.
 
+
+## Batch registration (`batch_register_callback`)
+
+Batch size is capped at `MAX_BATCH_SIZE` (20). Worst case is 20 payloads with
+max-length string fields: each payload costs one persistent write for the
+transaction (~512 B fee-rounded, see section 2), one temporary write for the
+idempotency key, one status-index update, and one event, plus a single
+`EventBatchProcessed`. Validation runs over the whole batch before any write,
+including an O(n^2) in-batch duplicate check (at most 190 comparisons). The
+cap is deliberately conservative to stay well under the per-transaction
+resource limits; raise it only after benchmarking.

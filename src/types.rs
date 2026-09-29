@@ -17,6 +17,25 @@ use soroban_sdk::{contracterror, contracttype, String};
 /// or an unexpected on-chain state, not against an incompatible new binary.
 pub const SCHEMA_VERSION: u32 = 1;
 
+// ─── Instance-storage size guardrails ────────────────────────────────────────
+
+/// Maximum number of entries permitted in any single instance-storage-backed
+/// aggregate structure (signer sets, relay allowlists, parameter registries,
+/// etc.).
+///
+/// Instance storage is read on essentially every contract call, so a single
+/// mis-sized aggregate entry has the widest blast radius of any storage tier.
+/// Soroban enforces a raw per-entry size limit at the platform level; hitting
+/// it mid-operation would abort the transaction with an opaque host error.
+/// This cap is deliberately set well below that raw limit so that growth is
+/// rejected with a clean, anticipated contract-level error
+/// ([`ContractError::InstanceStorageLimitExceeded`]) long before the platform
+/// limit is reachable.
+///
+/// Every instance-tier aggregate MUST enforce this cap on insertion. See
+/// [`ContractError::InstanceStorageLimitExceeded`].
+pub const MAX_INSTANCE_AGGREGATE_ENTRIES: u32 = 100;
+
 // ─── Transaction status ───────────────────────────────────────────────────────
 
 /// Mirrors the `status` column in the `transactions` table.
@@ -216,26 +235,17 @@ pub enum ContractError {
     InvalidAssetIssuer = 23,
     /// `idempotency_key` is empty.
     MissingIdempotencyKey = 24,
-    /// A `String` field exceeds its maximum allowed length (cost-control cap).
+    /// A `String` field exceeds its maximum permitted length.
     StringTooLong = 25,
 
-    // ── Transaction lifecycle ───────────────────────────────────────────────
-    /// No transaction with the given ID exists in storage.
-    TransactionNotFound = 30,
-    /// The requested status transition violates the state machine.
-    InvalidStatusTransition = 31,
-
-    // ── Idempotency ─────────────────────────────────────────────────────────
-    /// Request is a duplicate within the retention window (matches Redis 429).
-    DuplicateRequest = 40,
-
-    // ── Storage ─────────────────────────────────────────────────────────────
-    /// A ledger read/write produced an unexpected result.
-    StorageError = 50,
-
-    // ── Upgrade safety ──────────────────────────────────────────────────────
-    /// `upgrade()`'s `expected_schema_version` argument did not match the
-    /// on-chain [`SchemaVersion`](StorageKey::SchemaVersion); the upgrade was
-    /// aborted before touching contract WASM.
-    SchemaVersionMismatch = 60,
+    // ── Instance-storage guardrails ─────────────────────────────────────────
+    /// An instance-storage-backed aggregate structure (signer set, relay
+    /// allowlist, parameter registry, etc.) would grow past
+    /// [`MAX_INSTANCE_AGGREGATE_ENTRIES`].
+    ///
+    /// Rejected well before Soroban's raw per-entry size limit so the failure
+    /// is a clean, anticipated contract error rather than an opaque
+    /// platform-level abort. The offending structure and its cap are
+    /// identified by the calling code path.
+    InstanceStorageLimitExceeded = 30,
 }

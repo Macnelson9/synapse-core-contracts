@@ -47,10 +47,16 @@ supported.
 | [`EventContractUpgraded`](#eventcontractupgraded) | `upgrade` | `EventEmitter::contract_upgraded` | `upgrade` | **Live** |
 | [`EventStatusChanged`](#eventstatuschanged) | `status` | `EventEmitter::status_changed` | `start_processing`, `complete_transaction`, `fail_transaction` | **Live** |
 | [`EventTransactionCompleted`](#eventtransactioncompleted) | `done` | `EventEmitter::transaction_completed` | `complete_transaction` | **Live** |
-| [`EventTransactionFailed`](#eventtransactionfailed) | `fail` | `EventEmitter::transaction_failed` | `fail_transaction` | **Live** |
+| [`EventTransactionFailed`](#eventtransactionfailed) | `fail` | `EventEmitter::transaction_failed` | `complete_transaction` (route configured) | 1. `status`<br>2. `done`<br>3. `fwd` (`EventForwardingIntent { tx_id, next_phase }`, additive) |
+| `fail_transaction` | **Live** |
 | [`EventAdminTransferProposed`](#eventadmintransferproposed) | `propose` | `EventEmitter::admin_transfer_proposed` | `propose_admin` | **Live** |
 | [`EventAdminTransferred`](#eventadmintransferred) | `admin` | `EventEmitter::admin_transferred` | `accept_admin` | **Live** |
 | [`EventRelaySignerRotated`](#eventrelaysignerrotated) | `relay` | `EventEmitter::relay_signer_rotated` | `set_relay_signer` | **Live** |
+| [`EventSignerAttestationSet`](#eventsignerattestationset) | `attest` | `EventEmitter::signer_attestation_set` | `set_signer_attestation` | **Live** |
+| [`EventAdminRenounced`](#eventadminrenounced) | `renounce` | `EventEmitter::admin_renounced` | `renounce_admin` | **Live** |
+| [`EventGuardianSet`](#eventguardianset) | `guardian` | `EventEmitter::guardian_set` | `set_guardian` | **Live** |
+| [`EventAutoPaused`](#eventautopaused) | `apause` | `EventEmitter::auto_paused` | `trip_auto_pause` | **Live** |
+| [`EventAutoUnpaused`](#eventautounpaused) | `aunpause` | `EventEmitter::auto_unpaused` | `unpause_auto` (quorum met) | **Live** |
 
 **Locked schema** means topics, struct fields, types, and field order are fixed
 in this document and in `src/events.rs` even if the `publish` call is still
@@ -237,6 +243,82 @@ Verified by snapshot-style test
 | `admin` | `Address` | Admin that toggled |
 | `ledger` | `u32` | Ledger sequence at emit |
 
+### EventSignerAttestationSet
+
+| | |
+|--|--|
+| **Topics** | `synapse`, `attest` |
+| **Struct** | `EventSignerAttestationSet` |
+| **Emitted by** | `set_signer_attestation` |
+| **When** | Every attestation write, including no-op same-hash updates |
+| **Status** | Live |
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `signer` | `Address` | Relay signer that self-reported the fingerprint |
+| `build_hash` | `BytesN<32>` | Self-reported build/commit fingerprint (not cryptographically verified on-chain) |
+| `ledger` | `u32` | Ledger sequence at emit |
+
+### EventAdminRenounced
+
+| | |
+|--|--|
+| **Topics** | `synapse`, `renounce` |
+| **Struct** | `EventAdminRenounced` |
+| **Emitted by** | `renounce_admin` |
+| **When** | Outgoing admin acknowledges step-down after a live successor accepted |
+| **Status** | Live |
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `former_admin` | `Address` | Outgoing admin |
+| `successor` | `Address` | Live admin installed by prior `accept_admin` |
+| `ledger` | `u32` | Ledger sequence at emit |
+
+### EventGuardianSet
+
+| | |
+|--|--|
+| **Topics** | `synapse`, `guardian` |
+| **Struct** | `EventGuardianSet` |
+| **Emitted by** | `set_guardian` |
+| **When** | Guardian address set or rotated |
+| **Status** | Live |
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `guardian` | `Address` | New guardian |
+| `ledger` | `u32` | Ledger sequence at emit |
+
+### EventAutoPaused
+
+| | |
+|--|--|
+| **Topics** | `synapse`, `apause` |
+| **Struct** | `EventAutoPaused` |
+| **Emitted by** | `trip_auto_pause` |
+| **When** | Automatic circuit-breaker pause engaged |
+| **Status** | Live |
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `ledger` | `u32` | Ledger sequence at emit |
+
+### EventAutoUnpaused
+
+| | |
+|--|--|
+| **Topics** | `synapse`, `aunpause` |
+| **Struct** | `EventAutoUnpaused` |
+| **Emitted by** | `unpause_auto` (when 2-of-3 quorum is met) |
+| **When** | Automatic pause released by a role pair |
+| **Status** | Live |
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `roles` | `UnpauseRoles` | Winning pair: `AdminGuardian` / `AdminRelay` / `GuardianRelay` |
+| `ledger` | `u32` | Ledger sequence at emit |
+
 ---
 
 ## 4. Guaranteed emission order
@@ -258,6 +340,12 @@ invocation / transaction.
 | `set_relay_signer` | 1. `relay` |
 | `upgrade` | 1. `upgrade` |
 | `pause` / `unpause` | 1. `pause` |
+| `set_signer_attestation` | 1. `attest` |
+| `renounce_admin` | 1. `renounce` |
+| `set_guardian` | 1. `guardian` |
+| `trip_auto_pause` | 1. `apause` |
+| `unpause_auto` (quorum met) | 1. `aunpause` |
+| `unpause_auto` (vote only) | *(no events)* |
 
 **Rationale for `complete_transaction`:** Phase 2 indexers that listen only to
 `done` still see completion; those that key off `status` with
@@ -309,7 +397,8 @@ Before merging any PR that touches `src/events.rs` or event emit sites in
 
 1. Diff this file against `EventEmitter::*` and the `#[contracttype]` structs.
 2. Confirm topic symbols match `symbol_short!(...)` exactly (`init`, `reg`,
-   `pause`, `upgrade`, `status`, `done`, `fail`, `admin`, `relay`, `propose`).
+   `pause`, `upgrade`, `status`, `done`, `fail`, `admin`, `relay`, `propose`,
+   `attest`, `renounce`, `guardian`, `apause`, `aunpause`).
 3. Confirm multi-event order in §4 still matches the call sites.
 4. Run snapshot-style tests (e.g. `test_pause::test_upgrade_emits_contract_upgraded_event`)
    and any new event tests; topics in assertions must match §3.
@@ -324,3 +413,8 @@ Before merging any PR that touches `src/events.rs` or event emit sites in
 - Status enum: [`src/types.rs`](./src/types.rs) (`TransactionStatus`)
 - Upgradability / admin trust: [`DECISIONS.md`](./DECISIONS.md)
 - Version probe: `SynapseCoreContract::version`
+
+## Addendum: `merged` event
+
+`EventTransactionsMerged { canonical_tx_id, duplicate_tx_id, admin, reason, ledger }`,
+topic `merged`, emitted once by `merge_duplicate_transactions` (break-glass admin action).

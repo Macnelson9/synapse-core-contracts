@@ -267,3 +267,14 @@ Unit tests in `validation.rs` cover:
 - [SEP-23: Strkeys](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0023.md)
 - [Stellar Go `strkey` + CRC16-XModem](https://github.com/stellar/go/tree/master/strkey)
 
+
+## Timelocked relay-signer rotation
+
+`propose_relay_signer` / `finalize_relay_signer` / `cancel_relay_signer_change`
+mirror the two-step admin transfer (ADR-0002): pending state in persistent storage,
+one event per step, admin-gated. Delay is in ledgers (default 17_280, about 24h;
+configurable via `set_relay_signer_delay`). A second proposal replaces the pending
+one and restarts the delay. Assumptions: with the N-of-M set (ADR-0004) only the
+primary signer slot is rotated; the legacy immediate `set_relay_signer` stays for
+backward compatibility until a non-zero delay is configured, after which it returns
+`TimelockRequired`.

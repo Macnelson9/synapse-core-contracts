@@ -148,3 +148,13 @@ everywhere else in the contract, at low implementation cost.
 - [`EVENTS.md`](../../EVENTS.md) — `EventAdminTransferProposed`, `EventAdminTransferred`
 - [`CHANGELOG.md`](../../CHANGELOG.md) — breaking-change notice for the
   removed `transfer_admin`
+
+## Amendment: optional acceptance-window expiry
+
+`propose_admin_with_expiry(new_admin, expiry)` attaches an optional ledger
+timestamp (seconds) to a pending proposal. `accept_admin` fails with
+`AdminProposalExpired` when `timestamp > expiry` (the boundary is inclusive:
+accepting at exactly `expiry` succeeds). `propose_admin` creates a proposal with
+no expiry, preserving the original semantics. `cancel_admin_proposal(caller)`
+lets the current admin withdraw a pending proposal; it fails with
+`NoPendingAdminTransfer` once nothing is pending (e.g. after acceptance).

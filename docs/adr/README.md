@@ -17,6 +17,7 @@ to the old one; the old file is never modified or deleted.
 | [0001](./0001-relay-signer-trust-model.md) | Relay-signer trust model | Accepted | 2025-Q1 |
 | [0002](./0002-two-step-admin-transfer.md) | Two-step admin transfer with self-nomination guard | Accepted | 2026-Q3 |
 | [0003](./0003-upgrade-schema-version-guard.md) | Upgrade schema-version guard | Accepted | 2026-Q3 |
+| [0004](./0004-guardian-emergency-admin-revocation.md) | Guardian-quorum emergency admin revocation | Proposed | 2026-Q3 |
 
 ---
 

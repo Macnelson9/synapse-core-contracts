@@ -47,6 +47,10 @@ const MAX_CALLBACK_STATUS_LEN: u32 = 32;
 const MAX_STELLAR_TX_HASH_LEN: u32 = 72;
 /// Maximum length for `failure_reason` (short human-readable code).
 const MAX_FAILURE_REASON_LEN: u32 = 64;
+/// Maximum length of a single transaction tag.
+pub const MAX_TAG_LEN: u32 = 32;
+/// Maximum number of tags per transaction.
+pub const MAX_TAGS_PER_TX: u32 = 8;
 
 /// Encoded ed25519 public-key strkey length (SEP-23).
 const STRKEY_ENCODED_LEN: u32 = 56;
@@ -146,12 +150,27 @@ impl Validator {
     pub fn validate_payload(env: &Env, payload: &CallbackPayload) -> Result<(), ContractError> {
         Self::validate_stellar_account(env, &payload.stellar_account)?;
         Self::validate_amount(payload.amount)?;
+        Self::validate_amount_ceiling(env, &payload.asset_issuer, payload.amount)?;
         Self::validate_asset_code(env, &payload.asset_code)?;
         Self::validate_asset_issuer(env, &payload.asset_issuer)?;
         Self::validate_idempotency_key(env, &payload.idempotency_key)?;
         Self::validate_transaction_id(&payload.transaction_id)?;
         Self::validate_anchor_transaction_id(&payload.anchor_transaction_id)?;
         Self::validate_callback_status(&payload.callback_status)?;
+        Ok(())
+    }
+
+    /// Reject amounts above the per-anchor ceiling (anchor = `asset_issuer`);
+    /// anchors without an explicit entry use the contract-wide default.
+    /// Exactly-at-ceiling is allowed.
+    pub fn validate_amount_ceiling(
+        env: &Env,
+        anchor: &String,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        if amount > crate::storage::StorageClient::get_amount_ceiling(env, anchor) {
+            return Err(ContractError::AmountCeilingExceeded);
+        }
         Ok(())
     }
 
@@ -229,6 +248,29 @@ impl Validator {
     /// Failure reason: max length enforced for rent cost control.
     pub fn validate_failure_reason(reason: &String) -> Result<(), ContractError> {
         enforce_max_length(reason, MAX_FAILURE_REASON_LEN)
+    }
+
+    /// Tag: non-empty, length-capped, and the tx must have room for one more.
+    pub fn validate_tag(tag: &String, existing_count: u32) -> Result<(), ContractError> {
+        if tag.len() == 0 {
+            return Err(ContractError::EmptyTag);
+        }
+        enforce_max_length(tag, MAX_TAG_LEN)?;
+        if existing_count >= MAX_TAGS_PER_TX {
+            return Err(ContractError::TooManyTags);
+        }
+        Ok(())
+    }
+
+    /// Partial settlement: require `0 < settled < original`.
+    ///
+    /// Equal amounts must use `complete_transaction`; greater amounts are a
+    /// different bug class and are rejected too.
+    pub fn validate_settled_amount(settled: i128, original: i128) -> Result<(), ContractError> {
+        if settled <= 0 || settled >= original {
+            return Err(ContractError::InvalidSettledAmount);
+        }
+        Ok(())
     }
 
     /// Reject nominating the contract's own address as the next admin.

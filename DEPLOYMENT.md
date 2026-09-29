@@ -294,3 +294,16 @@ baseline fees, dominated by the initial persistent-write cost.
 - **SHOULD NOT** be the same key used for deployment or relay signing
 - **SHOULD** be monitored for unexpected usage
 - **SHOULD** have a key-rotation plan documented before mainnet launch
+---
+
+## Break-glass: merging duplicate transactions
+
+`merge_duplicate_transactions(canonical_tx_id, duplicate_tx_id, caller, reason)`
+is an admin-only recovery tool, **not** a routine operation. Use it only when
+evidence shows a replay slipped through as a separate `transaction_id` (e.g.
+before the F-07 durable guard existed). The duplicate is never deleted: it is
+marked `Failed` with `failure_reason = "merged"`, gets a `MergedInto(canonical)`
+marker (query with `get_merged_into`) and an `EventTransactionsMerged` (`merged`
+topic) is emitted carrying `reason`. Settled (`Completed`) duplicates, self-merges
+and already-merged records are rejected. Record the evidence off-chain alongside
+the event.

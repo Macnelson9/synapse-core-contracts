@@ -1030,3 +1030,168 @@ fn test_full_lifecycle_pending_to_processing_to_completed() {
     assert_eq!(tx.failure_reason, String::from_str(&env, ""));
     assert!(tx.updated_at_ledger >= tx.created_at_ledger);
 }
+
+// ─── cancel_transaction ───────────────────────────────────────────────────────
+
+#[test]
+fn test_cancel_transaction_by_relay_and_admin() {
+    let (env, client, admin, relay) = setup();
+    let a = client.register_callback(&payload_with(&env, "tx-c1", "k-c1"));
+    let b = client.register_callback(&payload_with(&env, "tx-c2", "k-c2"));
+    client.start_processing(&b, &relay);
+    let reason = String::from_str(&env, "duplicate");
+    client.cancel_transaction(&a, &reason, &relay);
+    client.cancel_transaction(&b, &reason, &admin);
+    assert_eq!(client.get_status(&a), TransactionStatus::Cancelled);
+    assert_eq!(client.get_status(&b), TransactionStatus::Cancelled);
+}
+
+#[test]
+fn test_cancel_transaction_rejects_stranger_and_illegal_states() {
+    let (env, client, _admin, relay) = setup();
+    let reason = String::from_str(&env, "r");
+    let tx_id = client.register_callback(&payload_with(&env, "tx-c3", "k-c3"));
+    let stranger = Address::generate(&env);
+    assert!(client.try_cancel_transaction(&tx_id, &reason, &stranger).is_err());
+
+    client.cancel_transaction(&tx_id, &reason, &relay);
+    assert_eq!(
+        client.try_cancel_transaction(&tx_id, &reason, &relay),
+        Err(Ok(ContractError::AlreadyCancelled))
+    );
+
+    let done = client.register_callback(&payload_with(&env, "tx-c4", "k-c4"));
+    client.start_processing(&done, &relay);
+    client.complete_transaction(&done, &String::from_str(&env, "hash-1"), &relay);
+    assert_eq!(
+        client.try_cancel_transaction(&done, &reason, &relay),
+        Err(Ok(ContractError::CannotCancel))
+    );
+
+    let failed = client.register_callback(&payload_with(&env, "tx-c5", "k-c5"));
+    client.fail_transaction(&failed, &reason, &relay);
+    assert_eq!(
+        client.try_cancel_transaction(&failed, &reason, &relay),
+        Err(Ok(ContractError::CannotCancel))
+    );
+
+    let missing = String::from_str(&env, "nope");
+    assert_eq!(
+        client.try_cancel_transaction(&missing, &reason, &relay),
+        Err(Ok(ContractError::TransactionNotFound))
+    );
+}
+
+// ─── retry_transaction ────────────────────────────────────────────────────────
+
+#[test]
+fn test_retry_transaction_cycle_and_limit() {
+    let (env, client, _admin, relay) = setup();
+    let reason = String::from_str(&env, "horizon_timeout");
+    let tx_id = client.register_callback(&payload_with(&env, "tx-r1", "k-r1"));
+    for n in 1..=3u32 {
+        client.start_processing(&tx_id, &relay);
+        client.fail_transaction(&tx_id, &reason, &relay);
+        client.retry_transaction(&tx_id, &relay);
+        let tx = client.get_transaction(&tx_id);
+        assert_eq!(tx.status, TransactionStatus::Pending);
+        assert_eq!(tx.retry_count, n);
+    }
+    client.fail_transaction(&tx_id, &reason, &relay);
+    assert_eq!(
+        client.try_retry_transaction(&tx_id, &relay),
+        Err(Ok(ContractError::RetryLimitExceeded))
+    );
+}
+
+#[test]
+fn test_retry_transaction_rejects_non_failed() {
+    let (env, client, _admin, relay) = setup();
+    let tx_id = client.register_callback(&payload_with(&env, "tx-r2", "k-r2"));
+    assert_eq!(
+        client.try_retry_transaction(&tx_id, &relay),
+        Err(Ok(ContractError::InvalidStatusTransition))
+    );
+}
+
+// ─── get_transactions_by_status ───────────────────────────────────────────────
+
+#[test]
+fn test_get_transactions_by_status_pagination_and_transitions() {
+    let (env, client, _admin, relay) = setup();
+    let ids = ["tx-p1", "tx-p2", "tx-p3"];
+    for (i, id) in ids.iter().enumerate() {
+        let key = ["k-p1", "k-p2", "k-p3"][i];
+        client.register_callback(&payload_with(&env, id, key));
+    }
+    let p = TransactionStatus::Pending;
+    let page1 = client.get_transactions_by_status(&p, &0, &2);
+    let page2 = client.get_transactions_by_status(&p, &2, &2);
+    assert_eq!(page1.len(), 2);
+    assert_eq!(page2.len(), 1);
+    assert_eq!(client.get_transactions_by_status(&p, &3, &2).len(), 0);
+
+    client.start_processing(&String::from_str(&env, "tx-p1"), &relay);
+    assert_eq!(client.get_transactions_by_status(&p, &0, &10).len(), 2);
+    let proc = client.get_transactions_by_status(&TransactionStatus::Processing, &0, &10);
+    assert_eq!(proc.len(), 1);
+}
+
+#[test]
+fn test_get_transactions_by_status_rejects_bad_limit() {
+    let (_env, client, _admin, _relay) = setup();
+    let p = TransactionStatus::Pending;
+    assert_eq!(
+        client.try_get_transactions_by_status(&p, &0, &0),
+        Err(Ok(ContractError::InvalidPageLimit))
+    );
+    assert_eq!(
+        client.try_get_transactions_by_status(&p, &0, &51),
+        Err(Ok(ContractError::InvalidPageLimit))
+    );
+}
+
+// ─── batch_register_callback ──────────────────────────────────────────────────
+
+#[test]
+fn test_batch_register_callback_happy_path() {
+    let (env, client, _admin, relay) = setup();
+    let mut v = soroban_sdk::Vec::new(&env);
+    v.push_back(payload_with(&env, "tx-b1", "k-b1"));
+    v.push_back(payload_with(&env, "tx-b2", "k-b2"));
+    assert_eq!(client.batch_register_callback(&v, &relay), 2);
+    assert_eq!(
+        client.get_status(&String::from_str(&env, "tx-b2")),
+        TransactionStatus::Pending
+    );
+}
+
+#[test]
+fn test_batch_register_callback_is_atomic_and_bounded() {
+    let (env, client, _admin, relay) = setup();
+    let mut bad = payload_with(&env, "tx-b4", "k-b4");
+    bad.amount = 0;
+    let mut v = soroban_sdk::Vec::new(&env);
+    v.push_back(payload_with(&env, "tx-b3", "k-b3"));
+    v.push_back(bad);
+    assert!(client.try_batch_register_callback(&v, &relay).is_err());
+    assert!(client.try_get_status(&String::from_str(&env, "tx-b3")).is_err());
+
+    // Duplicate of an on-chain id aborts the whole batch.
+    client.register_callback(&payload_with(&env, "tx-b5", "k-b5"));
+    let mut d = soroban_sdk::Vec::new(&env);
+    d.push_back(payload_with(&env, "tx-b6", "k-b6"));
+    d.push_back(payload_with(&env, "tx-b5", "k-b7"));
+    assert_eq!(
+        client.try_batch_register_callback(&d, &relay),
+        Err(Ok(ContractError::DuplicateRequest))
+    );
+    assert!(client.try_get_status(&String::from_str(&env, "tx-b6")).is_err());
+
+    // Empty batch rejected.
+    let empty = soroban_sdk::Vec::new(&env);
+    assert_eq!(
+        client.try_batch_register_callback(&empty, &relay),
+        Err(Ok(ContractError::InvalidBatchSize))
+    );
+}
